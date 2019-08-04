@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from pymongo import MongoClient
 import sys
 
-# I add this line for testing notification from github to slack!
+# I add this line for testing notification from github to slack-2!
 
 class BackTest(object):
     def __init__(self, strategy, initial_cash, enable_cost=True, enable_db=True):
