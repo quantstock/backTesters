@@ -12,6 +12,8 @@ from pymongo import MongoClient
 import sys
 import pyfolio as pf
 
+# I add this line for testing notification from github to slack!
+
 class BackTest(object):
     def __init__(self, strategy, initial_cash, enable_cost=True, enable_db=True):
         self.initial_cash = initial_cash
@@ -245,7 +247,11 @@ class BackTest(object):
         benchmark_df["收盤指數"] = benchmark_df["收盤指數"].apply(lambda x:
         	                                             float(x.replace("--", "0").replace('---',"0").replace(",", "")))
         # Renormalize to the initial_cash
+# <<<<<<< bt_stat
         # benchmark_df['收盤指數'] = self.initial_cash/benchmark_df['收盤指數'].iloc[0]*benchmark_df['收盤指數']
+# =======
+#         benchmark_df['收盤指數'] = self.initial_cash/benchmark_df['收盤指數'].iloc[0]*benchmark_df['收盤指數']
+# >>>>>>> master
 
         benchmark_df = benchmark_df.rename(columns = {"收盤指數" : "benchmark"}).loc[startTime: endTime]
         return benchmark_df
