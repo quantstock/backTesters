@@ -10,6 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from pymongo import MongoClient
 import sys
+import pyfolio as pf
 
 # I add this line for testing notification from github to slack!
 
@@ -27,10 +28,27 @@ class BackTest(object):
             self.exRight_exDividens_df = pd.read_pickle("../ML_TA/data/exRight_exDividens.pickle").set_index("timestamp")
 
         self.stgy_df = self.__get_stgy_df(strategy)
+        self.final_df = None
 
     def get_backtest_df(self):
         self.final_df = self.__execute_backtest()
         return self.final_df
+
+    def get_pf_charts(self):
+        """get return and position df for pyfolio to analyze"""
+        self.final_df = self.__execute_backtest()
+        self.pf_return_df = df["total_capital"].pct_change(1)
+        self.pf_position_df = df[[s for s in df.columns.values if "portfolio_" in s] + ["cash"]]
+        self.benchmark_df = df["benchmark"].pct_change(1)
+        # self.transactions_df = self.__get_transactions_df()
+        pf.create_full_tear_sheet(returns=self.pf_return_df,
+                                  positions=self.pf_position_df,
+                                  benchmark_rets=self.benchmark_df)#,
+#                                  transactions=self.transactions_df)
+
+    def __get_transactions_df(self):
+        """將交易成本的細項合併成df, 以供後續pyfolio使用"""
+        return pd.concat(self.multiple_trans_dfs, axis=0)
 
     def __get_stgy_df(self, stgy):
         mod_stgy = []
@@ -59,6 +77,7 @@ class BackTest(object):
 
     def __execute_backtest(self):
         multiple_dfs = []
+        self.multiple_trans_dfs = []
         #針對每隻標的計算獲利、虧損與交易成本
         for col in self.stgy_df.columns:
             startTime = self.stgy_df[col].index[0]
@@ -66,8 +85,9 @@ class BackTest(object):
             stgy_on_stock_df = self.stgy_df[col]
             stockId = col.split("position_")[1]
             #計算個股的虧損
-            single_df = self.__get_single_asset_df(stockId, startTime, endTime, stgy_on_stock_df)
+            single_df, single_trans_df = self.__get_single_asset_df(stockId, startTime, endTime, stgy_on_stock_df)
             multiple_dfs.append(single_df)
+            self.multiple_trans_dfs.append(single_trans_df)
         #計算集合獲利與虧損
         final_df = self.__get_multiple_asset_df(multiple_dfs, cash=self.initial_cash)
         benchmark_df = self.__get_db_benchmark_df(startTime=final_df.index[0], endTime=final_df.index[-1])
@@ -146,11 +166,22 @@ class BackTest(object):
             temp_df["profit_{}".format(stockId)] = (temp_df["profit_{}".format(stockId)].fillna(0) +
                                                         temp_df["權值加息值"].fillna(0) * temp_df["position_{}".format(stockId)]
                                                    ).replace(0, np.nan)
-            temp_df = temp_df.drop(columns=["close", "權值加息值"])
+            temp_df = temp_df.drop(columns=["權值加息值"])
         except KeyError:
-            temp_df = temp_df.drop(columns=["close"])
+            temp_df = temp_df
 
-        return temp_df
+        # 重新命名close
+        temp_df = temp_df.rename(columns={"close": "price_{}".format(stockId)})
+
+        # 創造交易費用的df 以供pyfolio計算
+        trans_df = temp_df.copy()
+        trans_df = trans_df.rename(columns={"abs_cost_{}".format(stockId):"amount",
+                                            "price_{}".format(stockId): "price"})
+        trans_df["symbol"] = stockId
+        trans_df = trans_df.loc[trans_df["amount"].dropna().index]
+        trans_df = trans_df[["amount", "price", "symbol"]]
+
+        return temp_df, trans_df
 
     def __get_multiple_asset_df(self, df_list, cash):
         """
@@ -168,6 +199,7 @@ class BackTest(object):
         net_profit_name_list = [s for s in temp_df.columns if "profit" in s]
         position_name_list = [s for s in temp_df.columns if "position" in s]
         portfolio_name_list = [s for s in temp_df.columns if "portfolio" in s]
+        price_name_list = [s for s in temp_df.columns if "price" in s]
 
         temp_df[portfolio_name_list] = temp_df[portfolio_name_list].fillna(method="ffill")
         temp_df[position_name_list] = temp_df[position_name_list].fillna(method="ffill")
@@ -192,7 +224,10 @@ class BackTest(object):
         temp_df["cash"] = temp_df["cash"].fillna(method="ffill") #把現金中沒有值的地方，用上一個非nan的值填起來
         temp_df["total_capital"] = temp_df["cash"] + temp_df["net_asset_portfolio"] #計算總資產
 
-        temp_df = temp_df[["total_capital", "cash", "net_cost", "net_profit", "net_asset_portfolio"] + position_name_list + portfolio_name_list]
+        temp_df = temp_df[["total_capital", "cash", "net_cost", "net_profit", "net_asset_portfolio"] +
+                            position_name_list +
+                            portfolio_name_list +
+                            price_name_list]
 
         return temp_df
 
@@ -212,7 +247,11 @@ class BackTest(object):
         benchmark_df["收盤指數"] = benchmark_df["收盤指數"].apply(lambda x:
         	                                             float(x.replace("--", "0").replace('---',"0").replace(",", "")))
         # Renormalize to the initial_cash
-        benchmark_df['收盤指數'] = self.initial_cash/benchmark_df['收盤指數'].iloc[0]*benchmark_df['收盤指數']
+# <<<<<<< bt_stat
+        # benchmark_df['收盤指數'] = self.initial_cash/benchmark_df['收盤指數'].iloc[0]*benchmark_df['收盤指數']
+# =======
+#         benchmark_df['收盤指數'] = self.initial_cash/benchmark_df['收盤指數'].iloc[0]*benchmark_df['收盤指數']
+# >>>>>>> master
 
         benchmark_df = benchmark_df.rename(columns = {"收盤指數" : "benchmark"}).loc[startTime: endTime]
         return benchmark_df
@@ -278,30 +317,32 @@ class BackTest(object):
             if x < 0:  # short, both fee and tax
                 cost = np.minimum(-20, x * fee) + x * tax
             elif x > 0: # long, fee only
-                cost = x * fee
+                # cost = x * fee
+                cost = np.maximum(20, x * fee)
             else:
                 cost = 0
             return np.abs(cost)
         else: return 0
 
 class FixedInvestmentStrategy(object):
-    def __init__(self, stockId, startTime, endTime, initial_cash, annual_interest_rate, freq, position):
-        self.stockId = stockId
+    def __init__(self, stockId_list, startTime, endTime, initial_cash, annual_interest_rate, freq, position_list, cash_delta):
+        self.stockId_list = stockId_list
         self.startTime = startTime
         self.endTime = endTime
         self.initial_cash = initial_cash
         self.annual_interest_rate = annual_interest_rate
         self.freq = freq
-        self.position = position
+        self.position_list = position_list
+        self.cash_delta = cash_delta
 
     def df_to_strategy(self, df):
         output_stgy = []
         for t in df.index:
             stockList = []
-            for c in df.columns:
-                position = df[c].loc[t]
-                stockId = c
-                stockList.append({"stockId": c, "position": position})
+            for stockId in df.columns:
+                print(stockId)
+                position = df[stockId].loc[t]
+                stockList.append({"stockId": stockId, "position": position})
             output_stgy.append({"timestamp": t.to_pydatetime(), "stockList": stockList})
         return output_stgy
 
@@ -309,35 +350,39 @@ class FixedInvestmentStrategy(object):
         df = pd.DataFrame(index=pd.date_range(start=self.startTime, end=self.endTime, freq=self.freq))
         df["risk_free_cash"] = 0
         df["risk_free_cash"].iloc[0] = self.initial_cash
+
         for i in range(1, df.shape[0]):
-            df["risk_free_cash"].iloc[i] =  df["risk_free_cash"].iloc[i-1] * (1 + self.annual_interest_rate/12)
+            df["risk_free_cash"].iloc[i] =  df["risk_free_cash"].iloc[i-1] * (1 + self.annual_interest_rate/2)+ self.cash_delta
         return df["risk_free_cash"]
 
     def get_fixedInvestment_df(self):
         df = pd.DataFrame(index=pd.date_range(start=self.startTime, end=self.endTime, freq=self.freq))
-        df[self.stockId] = self.position
-        df[self.stockId] = df[self.stockId].cumsum()
+        for stockId, position in zip(self.stockId_list, self.position_list):
+            df[stockId] = position
+            df[stockId] = df[stockId].cumsum()
 
         output_stgy = self.df_to_strategy(df)
 
         cash_df = self.get_cash_interest_df()
 
-        backtest = BackTest(output_stgy, initial_cash = self.initial_cash, enable_db=False)
-        output_df = backtest.get_backtest_df()
-        output_df = pd.concat([output_df, cash_df], axis=1).fillna(method="ffill")
-        return output_df
+        backtest = BackTest(output_stgy, initial_cash = self.initial_cash, enable_db=True)
+        # output_df = backtest.get_backtest_df()
+        # output_df = pd.concat([output_df, cash_df], axis=1).fillna(method="ffill")
+        return backtest
+
 
 
 if __name__ == '__main__':
-    startTime = "2004/01/01"
-    endTime = "2019/07/30"
-    stockId = "0050"
-    freq = "1M"
-    position = 10
-    initial_cash = 1.1e5
+    startTime = "2010/01/01"
+    endTime = "2019/08/04"
+    stockId_list = ["2330", "1101"]
+    freq = "6M"
+    position_list = [5000, -50000]
+    initial_cash = 1e7
+    # cash_delta = 60000
     annual_interest_rate = 0.01
 
-    fixedStrategy = FixedInvestmentStrategy(stockId, startTime, endTime, initial_cash, annual_interest_rate, freq, position)
-    output_df = fixedStrategy.get_fixedInvestment_df()
-    output_df[["total_capital" ,"risk_free_cash"]].plot()
-    plt.show()
+    fixedStrategy = FixedInvestmentStrategy(stockId_list, startTime, endTime, initial_cash, annual_interest_rate, freq, position_list, cash_delta)
+    bt = fixedStrategy.get_fixedInvestment_df()
+    df = bt.get_backtest_df()
+    bt.get_pf_charts()
