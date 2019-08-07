@@ -34,7 +34,7 @@ class BackTest(object):
         self.final_df = self.__execute_backtest()
         return self.final_df
 
-    def get_pf_charts(self):
+    def get_pf_charts(self, df):
         """get return and position df for pyfolio to analyze"""
         self.final_df = self.__execute_backtest()
         self.pf_return_df = df["total_capital"].pct_change(1)
@@ -118,7 +118,10 @@ class BackTest(object):
             OKedStrategyDaysArray = pd.to_datetime(modTradingDayList[mask]).values
             for d in OKedStrategyDaysArray:
                 okedList.append(d)
-        finalStrategyDaysArray = np.concatenate((OKstrategyDaysArray, np.array(okedList)), axis=None)
+        try:
+            finalStrategyDaysArray = np.concatenate((OKstrategyDaysArray, np.array(okedList)), axis=None)
+        except:
+            finalStrategyDaysArray = OKstrategyDaysArray
 
         def npdt64Todatetime(dt64array):
             ts = (dt64array - np.datetime64('1970-01-01T00:00:00')) / np.timedelta64(1, 's')
