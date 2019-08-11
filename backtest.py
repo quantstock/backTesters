@@ -11,14 +11,17 @@ import matplotlib.pyplot as plt
 from pymongo import MongoClient
 import sys
 import pyfolio as pf
+from functools import reduce
 
 # I add this line for testing notification from github to slack!
 
 class BackTest(object):
-    def __init__(self, strategy, initial_cash, enable_cost=True, enable_db=True):
+
+    def __init__(self, strategy, initial_cash, enable_cost=True, enable_db=True, bM='發行量加權股價指數'):
         self.initial_cash = initial_cash
         self.enable_cost = enable_cost
         self.enable_db = enable_db
+        self.BM_Name = bM
 
         if self.enable_db:
             self.__connect_db()
@@ -36,11 +39,11 @@ class BackTest(object):
 
     def get_pf_charts(self, df):
         """get return and position df for pyfolio to analyze"""
-        self.final_df = self.__execute_backtest()
-        self.pf_return_df = df["total_capital"].pct_change(1)
-        self.pf_position_df = df[[s for s in df.columns.values if "portfolio_" in s] + ["cash"]]
-        self.benchmark_df = df["benchmark"].pct_change(1)
-        # self.transactions_df = self.__get_transactions_df()
+        self.pf_return_df = df['Results']["total_capital"].pct_change(1)
+        pf_position_dfList = [s for s in a.columns if 'portfolio'==s[1]]
+        self.pf_position_df = df[pf_position_dfList + [('Results', "cash")]]
+        self.pf_position_df.columns = [s[0] for s in pf_position_dfList] + ['cash']
+        self.benchmark_df = df["benchmark"][self.BM_Name].pct_change(1)
         pf.create_full_tear_sheet(returns=self.pf_return_df,
                                   positions=self.pf_position_df,
                                   benchmark_rets=self.benchmark_df)#,
@@ -50,48 +53,28 @@ class BackTest(object):
         """將交易成本的細項合併成df, 以供後續pyfolio使用"""
         return pd.concat(self.multiple_trans_dfs, axis=0)
 
-    def __get_stgy_df(self, stgy):
-        mod_stgy = []
-        # 將strategy存進dataframe
-        for t in stgy:
-            for sl in t["stockList"]:
-                mod_stgy.append({"timestamp": t["timestamp"], "stockId": sl["stockId"], "position": sl["position"]})
+    def __get_stgy_df(self, stgy_df):
 
-        mod_stgy_df = pd.DataFrame(mod_stgy).set_index('timestamp')
-        stocklist = mod_stgy_df["stockId"].drop_duplicates().values
-
-        # 將部位相對變動量存進df
-        temp_dfs = []
         agg_dict = {}
-        for s in stocklist:
-            temp_df = mod_stgy_df[mod_stgy_df["stockId"] == s]["position"]
-            temp_df.name = "position_{}".format(s)
-            temp_dfs.append(temp_df)
-            agg_dict.update({temp_df.name: sum})
-        stgy_df = pd.concat(temp_dfs, axis=1)
+
+        for si in stgy_df.columns.levels[0]:
+            agg_dict.update({(si, 'position'): sum})
 
         stgy_df.index = self.__check_traded_days(stgy_df.index.to_list())
         # 將平移後的多筆交易和為一筆
         stgy_df = stgy_df.groupby(stgy_df.index).agg(agg_dict)
+        self.stgy_df = stgy_df
         return stgy_df
 
     def __execute_backtest(self):
-        multiple_dfs = []
-        self.multiple_trans_dfs = []
-        #針對每隻標的計算獲利、虧損與交易成本
-        for col in self.stgy_df.columns:
-            startTime = self.stgy_df[col].index[0]
-            endTime = self.stgy_df[col].index[-1]
-            stgy_on_stock_df = self.stgy_df[col]
-            stockId = col.split("position_")[1]
-            #計算個股的虧損
-            single_df, single_trans_df = self.__get_single_asset_df(stockId, startTime, endTime, stgy_on_stock_df)
-            multiple_dfs.append(single_df)
-            self.multiple_trans_dfs.append(single_trans_df)
-        #計算集合獲利與虧損
-        final_df = self.__get_multiple_asset_df(multiple_dfs, cash=self.initial_cash)
-        benchmark_df = self.__get_db_benchmark_df(startTime=final_df.index[0], endTime=final_df.index[-1])
+        singDf_List = self.__get_single_asset_df()
+        final_df = self.__get_multiple_asset_df(singDf_List)
+        # #
+        benchmark_df = self.__get_db_benchmark_df(startTime=self.stgy_df.index[0], endTime=self.stgy_df.index[-1])
+        benchmark_df.columns = pd.MultiIndex.from_tuples([('benchmark', self.BM_Name)])
+        self.final_df= final_df
         final_df = pd.concat([final_df, benchmark_df], axis=1)
+        # final_df = final_df.loc[final_df.xs('position', level=1, axis=1).isnull().prod(axis=1) == 0]
         return final_df
 
     def __check_traded_days(self, timestampList):
@@ -130,7 +113,8 @@ class BackTest(object):
 
         return finalStrategyDaysList
 
-    def __get_single_asset_df(self, stockId, startTime, endTime, stgy_on_stock_df):
+    # def __get_single_asset_df(self, stockId, startTime, endTime, stgy_on_stock_df):
+    def __get_single_asset_df(self):
         """
         fn: 取得個別資產在策略的起始與終止期間的獲利(或虧損)
         input:
@@ -142,51 +126,40 @@ class BackTest(object):
             pd.DataFrame with columns: ["position_stockId", "net_profit_stockId", "portfolio_stockId", "abs_cost_stockId"]
                 and datetime as index
         """
-        #獲取該資料的收盤價
-        close_df  = self.__get_db_close_series(stockId, startTime, endTime)
-        #收盤價和策略合併
-        temp_df = pd.concat([close_df, stgy_on_stock_df], axis=1).fillna(method="ffill").fillna(0)
-        #計算場上的投資盈虧
-        temp_df["portfolio_{}".format(stockId)] = (temp_df["close"] *
-                                                   temp_df["position_{}".format(stockId)]
-                                                  ).fillna(method="ffill")
+        df_List = []
+        for col in self.stgy_df.columns:
+            startTime = self.stgy_df[col].index[0]
+            endTime = self.stgy_df[col].index[-1]
+            stgy_on_stock_df = self.stgy_df[col]
+            stockId = col[0]
+            df = pd.concat([self.__get_db_close_series(stockId, startTime, endTime).drop_duplicates(keep="first"), self.stgy_df[stockId]], axis=1)  #獲取該資料的收盤價
 
-        temp2_series = stgy_on_stock_df.dropna() #找出策略的執行日期
-        exe_diff_series = temp2_series.diff() #找出策略的執行日期與當日該變動的數量
-        exe_diff_series.iloc[0] = temp2_series.iloc[0] #策略執行第一天，股票從零到有(或做空)
-        if self.enable_cost:
-            temp_df["abs_cost_{}".format(stockId)] = (exe_diff_series * close_df).apply(self.__parse_FeeAndTax).replace(0, np.nan) #計算交易費用與交易稅
-        else:
-            temp_df["abs_cost_{}".format(stockId)] = (exe_diff_series * close_df).apply(self.__parse_FeeAndTax) #計算交易費用與交易稅
+            df['portfolio']=df['position'] * df['close'] #計算場上的投資盈虧
+            temp2_series = df['position'].dropna() #找出策略的執行日期
+            exe_diff_series = temp2_series.diff() #找出策略的執行日期與當日該變動的數量
+            exe_diff_series.iloc[0] = temp2_series.iloc[0] #策略執行第一天，股票從零到有(或做空)
+            if self.enable_cost:
+                df["abs_cost"] = (exe_diff_series * df["close"]).apply(self.__parse_FeeAndTax).replace(0, np.nan) #計算交易費用與交易稅
+            else:
+                df["abs_cost"] = (exe_diff_series * df["close"]).apply(self.__parse_FeeAndTax)
 
-        temp_df["profit_{}".format(stockId)] = -1 * exe_diff_series * close_df #淨獲利，若是買入股票則是負值；賣出則為正
+            df["profit"] = -1 * exe_diff_series * df["close"] #淨獲利，若是買入股票則是負值；賣出則為正
 
-        #考慮除權息
-        try:
+            #考慮除權息
             ex_df = self.__get_db_ex_divided(stockId, startTime, endTime)
-            ex_df = ex_df.set_index("timestamp")["權值加息值"].apply(lambda x: float(x.replace(",", "")))
-            temp_df = pd.concat([temp_df, ex_df.drop_duplicates()], axis=1)
-            temp_df["profit_{}".format(stockId)] = (temp_df["profit_{}".format(stockId)].fillna(0) +
-                                                        temp_df["權值加息值"].fillna(0) * temp_df["position_{}".format(stockId)]
-                                                   ).replace(0, np.nan)
-            temp_df = temp_df.drop(columns=["權值加息值"])
-        except KeyError:
-            temp_df = temp_df
+            df=pd.concat([df, ex_df], axis = 1)
+            df["profit"] = (df["profit"].fillna(0) + df["權值加息值"].fillna(0)* df["position"]).replace(0, np.nan)
+            df = df.drop(columns=["權值加息值"])
+            df.columns = pd.MultiIndex.from_product([[stockId], df.columns])
+            self.df = df
+            df_List.append(df.dropna())
 
-        # 重新命名close
-        temp_df = temp_df.rename(columns={"close": "price_{}".format(stockId)})
+        self.df_List = df_List
+        return df_List
 
-        # 創造交易費用的df 以供pyfolio計算
-        trans_df = temp_df.copy()
-        trans_df = trans_df.rename(columns={"abs_cost_{}".format(stockId):"amount",
-                                            "price_{}".format(stockId): "price"})
-        trans_df["symbol"] = stockId
-        trans_df = trans_df.loc[trans_df["amount"].dropna().index]
-        trans_df = trans_df[["amount", "price", "symbol"]]
 
-        return temp_df, trans_df
-
-    def __get_multiple_asset_df(self, df_list, cash):
+    # def __get_multiple_asset_df(self, df_list, cash):
+    def __get_multiple_asset_df(self, singDf_List):
         """
         fn: 將多個從__get_single_asset_df傳回的df整合
         input: df_list: list結構，像是這樣: [{"df": df, "stockId": stockId}, ...]
@@ -195,44 +168,15 @@ class BackTest(object):
             ["total_capital", "net_profit", "net_asset_portfolio", "net_cost", "stockId1", "stockId2", ...]
             and datetime as index
         """
+        resultCol = ['net_cost', 'net_asset_portfolio', 'net_profit', 'cash', 'total_capital']
+        singDf_List = reduce(self.__red_PD_Concat, singDf_List).fillna(0) # concat small dfs together
+        sumDf = singDf_List.sum(axis=1, level=1)[['abs_cost', 'portfolio', 'profit']] # sum of things to be sum
+        g = -sumDf['abs_cost'] + sumDf['profit']
+        sumDf['cash'] = g.cumsum() + self.initial_cash # roll over the profit and add to the cash
+        sumDf["total_capital"] = sumDf["cash"] + sumDf["portfolio"]
+        sumDf.columns = pd.MultiIndex.from_product([['Results'], resultCol])
 
-        temp_df = pd.concat(df_list, axis=1)
-
-        abs_cost_name_list = [s for s in temp_df.columns if "abs_cost" in s]
-        net_profit_name_list = [s for s in temp_df.columns if "profit" in s]
-        position_name_list = [s for s in temp_df.columns if "position" in s]
-        portfolio_name_list = [s for s in temp_df.columns if "portfolio" in s]
-        price_name_list = [s for s in temp_df.columns if "price" in s]
-
-        temp_df[portfolio_name_list] = temp_df[portfolio_name_list].fillna(method="ffill")
-        temp_df[position_name_list] = temp_df[position_name_list].fillna(method="ffill")
-        if self.enable_cost:
-            temp_df["net_cost"] = temp_df[abs_cost_name_list].sum(axis=1).replace(0, np.nan)
-        else:
-            temp_df["net_cost"] = temp_df[abs_cost_name_list].sum(axis=1)
-        temp_df["net_profit"] = temp_df[net_profit_name_list].sum(axis=1)
-        temp_df["net_asset_portfolio"] = temp_df[portfolio_name_list].sum(axis=1)
-        # print(temp_df)
-
-        #計算現金變動
-        cash_list = []
-        for t in temp_df["net_cost"].dropna().index:      #只在有交易的時候，現金才會變動
-            sub_series = temp_df.loc[t]
-            cash = cash + sub_series["net_profit"] - sub_series["net_cost"] #更新現金數量 = 原有現金 + 淨獲利 - 摩擦成本
-            cash_list.append({"timestamp": t, "cash":cash}) #紀錄現金
-
-        cash_df = pd.DataFrame(cash_list).set_index('timestamp') #儲存成series
-        temp_df = pd.concat([temp_df, cash_df], axis=1) #將現金series合併進temp_df
-
-        temp_df["cash"] = temp_df["cash"].fillna(method="ffill") #把現金中沒有值的地方，用上一個非nan的值填起來
-        temp_df["total_capital"] = temp_df["cash"] + temp_df["net_asset_portfolio"] #計算總資產
-
-        temp_df = temp_df[["total_capital", "cash", "net_cost", "net_profit", "net_asset_portfolio"] +
-                            position_name_list +
-                            portfolio_name_list +
-                            price_name_list]
-
-        return temp_df
+        return pd.concat([sumDf, singDf_List], axis=1)
 
     def __connect_db(self):
         mongo_uri = 'mongodb://stockUser:stockUserPwd@localhost:27017/stock_data' # local mongodb address
@@ -241,14 +185,21 @@ class BackTest(object):
 
     def __get_db_benchmark_df(self, startTime, endTime):
         if self.enable_db:
-            benchmark_df = pd.DataFrame(list(self.db["dailyBenchmarks"].find(
-                    {"timestamp": {"$gt": startTime, "$lt": endTime},
-                     "stockId":"發行量加權股價指數"}, {"timestamp": 1, "收盤指數": 1}))).drop(columns="_id").drop_duplicates("timestamp").set_index("timestamp")
+            try:
+                benchmark_df = pd.DataFrame(list(self.db["dailyBenchmarks"].find(
+                        {"timestamp": {"$gt": startTime, "$lt": endTime},
+                         "stockId":self.BM_Name}, {"timestamp": 1, "收盤指數": 1}))).drop(columns="_id").drop_duplicates("timestamp").set_index("timestamp")
+                benchmark_df["收盤指數"] = benchmark_df["收盤指數"].apply(lambda x:
+                	                                             float(x.replace("--", "0").replace('---',"0").replace(",", "")))
+            except:
+                benchmark_df = pd.DataFrame(list(self.db["dailyPrice"].find(
+                        {"timestamp": {"$gt": startTime, "$lt": endTime},
+                         "stockId":self.BM_Name}, {"timestamp": 1, "收盤價": 1}))).drop(columns="_id").drop_duplicates("timestamp").set_index("timestamp")
+                benchmark_df["收盤價"] = benchmark_df["收盤價"].apply(lambda x:
+                	                                             float(x.replace("--", "0").replace('---',"0").replace(",", "")))
         else:
             benchmark_df = self.benchmark_df
 
-        benchmark_df["收盤指數"] = benchmark_df["收盤指數"].apply(lambda x:
-        	                                             float(x.replace("--", "0").replace('---',"0").replace(",", "")))
         # Renormalize to the initial_cash
 # <<<<<<< bt_stat
         # benchmark_df['收盤指數'] = self.initial_cash/benchmark_df['收盤指數'].iloc[0]*benchmark_df['收盤指數']
@@ -276,7 +227,7 @@ class BackTest(object):
             df = df[["收盤價", "最後揭示賣價", "最後揭示買價"]].loc[startTime: endTime]
 
         df["close"] = df.apply(self.__parse_close, axis=1)
-        df = df["close"]
+        df = df[["close"]]
         return df
 
     def __get_db_tradingDays_series(self):
@@ -296,10 +247,11 @@ class BackTest(object):
                             {"timestamp": {
                             "$gte": startTime, "$lte": endTime + datetime.timedelta(days=10)},
                             "stockId":stockId}
-                        ))).drop(columns="_id")
+                        ))).drop(columns="_id")[['timestamp', '權值加息值']].drop_duplicates("timestamp", keep="first")
         else:
-            df = (self.exRight_exDividens_df[self.exRight_exDividens_df["stockId"]==stockId]
-                    ).loc[startTime: endTime+ datetime.timedelta(days=10)]
+            df = (self.exRight_exDividens_df[self.exRight_exDividens_df["stockId"]==stockId]).loc[startTime: endTime+ datetime.timedelta(days=10)]
+        df = df.set_index('timestamp')
+        df['權值加息值'] = df['權值加息值'].apply(lambda x: float(x.replace(",", "")))
         return df
 
     def __parse_close(self, x):
@@ -325,7 +277,12 @@ class BackTest(object):
             else:
                 cost = 0
             return np.abs(cost)
-        else: return 0
+        else:
+            return 0
+
+    def __red_PD_Concat(self, a, b):
+        return pd.concat([a, b], axis=1)
+
 
 class FixedInvestmentStrategy(object):
     def __init__(self, stockId_list, startTime, endTime, initial_cash, annual_interest_rate, freq, position_list, cash_delta):
@@ -372,8 +329,6 @@ class FixedInvestmentStrategy(object):
         # output_df = backtest.get_backtest_df()
         # output_df = pd.concat([output_df, cash_df], axis=1).fillna(method="ffill")
         return backtest
-
-
 
 if __name__ == '__main__':
     startTime = "2010/01/01"
