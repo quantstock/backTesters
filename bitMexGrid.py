@@ -42,7 +42,7 @@ class bitMexGrid(object):
         self.df['position'] = firstPos
         self.df['portfolio'] = firstPos*self.df['EventPrice']
         self.df['cash'] = self.df['portfolio'][0] * (1+self.rPFluid)
-        self.df['rowNum'] = range(len(a))
+        self.df['rowNum'] = range(len(self.df))
         rowNum = self.df['rowNum'][self.df['Event'] != 0]
         self.df = self.df.drop(columns ='rowNum')
         self.df['profit'] = 0
@@ -77,5 +77,5 @@ class bitMexGrid(object):
         self.db = MongoClient(mongo_uri)[dbName]
 
 if __name__ == '__main__':
-    bM = bitMexGrid('XBTUSD', pd.Timestamp(2017, 1, 1, 0, 0, 00), pd.Timestamp(2017, 8, 19, 0, 0, 00), totalCash= 1e6)
+    bM = bitMexGrid('XBTUSD', pd.Timestamp(2017, 1, 1, 0, 0, 00), pd.Timestamp(2019, 8, 19, 0, 0, 00), totalCash= 1e6)
     bM.get_pf_charts()
